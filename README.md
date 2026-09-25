@@ -2,7 +2,7 @@
 
 **A tiny, zero-dependency reverse proxy that fixes the "thinking must be passed back" error** when you talk to Anthropic- or OpenAI-compatible AI gateways such as [QuantumNous/new-api](https://github.com/QuantumNous/new-api), [one-api](https://github.com/songquanpeng/one-api), LiteLLM, and similar translators.
 
-Works with **Claude Code**, **[pi](https://pi.dev)**, the OpenAI SDK, the Anthropic SDK, and anything else that speaks:
+Works with **Claude Code**, **[pi](https://pi.dev)** (the coding agent), the OpenAI SDK, the Anthropic SDK, and anything else that speaks:
 
 - **Anthropic Messages** → `POST /v1/messages`
 - **OpenAI Chat Completions** → `POST /v1/chat/completions`
@@ -465,9 +465,6 @@ Your gateway fingerprints clients. See [Provider gotchas](#provider-gotchas).
 
 **Will it slow down requests?**
 It adds a local hop and buffers the request body in memory. When no repair is needed there is no extra upstream call.
-
-**Can I run it on a Raspberry Pi?**
-Yes. Node 18+, zero dependencies, small memory footprint. Note that its in-memory cache makes the fallback more likely across restarts.
 
 **Can I run several instances?**
 Yes — give each its own `PORT`. Caches are not shared, so each instance has its own repair history.
