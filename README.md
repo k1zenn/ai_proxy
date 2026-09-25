@@ -1,6 +1,6 @@
 # AI Proxy
 
-**A tiny, zero-dependency reverse proxy that fixes the "thinking must be passed back" error** when you talk to Anthropic- or OpenAI-compatible AI gateways such as [AgentRouter](https://agentrouter.org), [QuantumNous/new-api](https://github.com/QuantumNous/new-api), [one-api](https://github.com/songquanpeng/one-api), LiteLLM, and similar translators.
+**A tiny, zero-dependency reverse proxy that fixes the "thinking must be passed back" error** when you talk to Anthropic- or OpenAI-compatible AI gateways such as [QuantumNous/new-api](https://github.com/QuantumNous/new-api), [one-api](https://github.com/songquanpeng/one-api), LiteLLM, and similar translators.
 
 Works with **Claude Code**, **[pi](https://pi.dev)**, the OpenAI SDK, the Anthropic SDK, and anything else that speaks:
 
@@ -86,7 +86,7 @@ You should see:
 
 ```
 thinking-fix-proxy listening on http://127.0.0.1:8787
-  upstream : https://agentrouter.org
+  upstream : https://your-gateway.example.com
   fallback : disable thinking on failure
   dialects : anthropic /v1/messages + openai /v1/chat/completions
 ```
@@ -95,7 +95,7 @@ Verify it is alive:
 
 ```bash
 curl http://127.0.0.1:8787/health
-# {"ok":true,"cache":0,"upstream":"https://agentrouter.org"}
+# {"ok":true,"cache":0,"upstream":"https://your-gateway.example.com"}
 ```
 
 Now point your client at `http://127.0.0.1:8787` (see below) and keep the proxy running.
@@ -111,7 +111,7 @@ The golden rule: **the proxy path is the same path your client already uses.** Y
 | OpenAI SDK | `http://127.0.0.1:8787/v1` | `/chat/completions` | `UPSTREAM` + `/v1/chat/completions` |
 | Anthropic SDK | `http://127.0.0.1:8787` | `/v1/messages` | `UPSTREAM` + `/v1/messages` |
 
-`UPSTREAM` is configured **without** a trailing `/v1` (default `https://agentrouter.org`).
+`UPSTREAM` is configured **without** a trailing `/v1` (for example `https://your-gateway.example.com`).
 
 ### Claude Code (Anthropic Messages)
 
@@ -137,11 +137,11 @@ Add or edit the provider in `~/.pi/agent/models.json` (note: this is the **top-l
 ```json
 {
   "providers": {
-    "agentrouter": {
-      "name": "AgentRouter",
+    "my-gateway": {
+      "name": "My Gateway",
       "baseUrl": "http://127.0.0.1:8787/v1",
       "api": "openai-completions",
-      "apiKey": "$AGENTROUTER_API_KEY",
+      "apiKey": "$MY_GATEWAY_API_KEY",
       "compat": { "supportsDeveloperRole": false },
       "models": [
         { "id": "claude-opus-5", "name": "claude-opus-5", "contextWindow": 200000 },
@@ -160,7 +160,7 @@ Two things that bite people:
 You can verify resolution before running anything:
 
 ```bash
-pi --list-models | grep agentrouter
+pi --list-models | grep my-gateway
 ```
 
 ### OpenAI SDK
@@ -217,7 +217,7 @@ Resolution order: **environment variable → `config.json` → built-in default.
 
 | Env var | `config.json` | Default | Description |
 | --- | --- | --- | --- |
-| `UPSTREAM` | `upstream` | `https://agentrouter.org` | Gateway base URL, **no** trailing slash and no `/v1` |
+| `UPSTREAM` | `upstream` | — | Gateway base URL, **no** trailing slash and no `/v1`. Point this at your gateway |
 | `PORT` | `port` | `8787` | Local port (`0` = random free port) |
 | `HOST` | `host` | `127.0.0.1` | Bind address; use `0.0.0.0` for clients outside WSL/containers |
 | `UPSTREAM_API_KEY` | `upstreamApiKey` | — | If set, overrides the client's key for every request |
@@ -232,7 +232,7 @@ Default `config.json`:
 
 ```json
 {
-  "upstream": "https://agentrouter.org",
+  "upstream": "https://your-gateway.example.com",
   "host": "127.0.0.1",
   "port": 8787,
   "log": true,
@@ -312,7 +312,7 @@ hostname -I | awk '{print $1}'      # WSL IP for the Windows-side client
 
 ```bash
 curl http://127.0.0.1:8787/health
-# {"ok":true,"cache":0,"upstream":"https://agentrouter.org"}
+# {"ok":true,"cache":0,"upstream":"https://your-gateway.example.com"}
 ```
 
 `cache` is the current number of cached thinking entries. It grows as tool-calling turns complete.
@@ -353,10 +353,10 @@ These are upstream behaviors that the proxy deliberately does **not** paper over
 
 ### Client fingerprinting
 
-Some gateways reject requests based on the client's `User-Agent` (and, less often, TLS fingerprint). AgentRouter, for example, returns:
+Some gateways reject requests based on the client's `User-Agent` (and, less often, TLS fingerprint). A gateway that does this typically returns:
 
 ```json
-{"error":{"message":"unauthorized client detected, contact support for assistance at https://discord.gg/HgekCyHJqB"},"message":"UNAUTHENTICATED","type":"unauthorized_client_error"}
+{"error":{"message":"unauthorized client detected"},"message":"UNAUTHENTICATED","type":"unauthorized_client_error"}
 ```
 
 for `curl`, `OpenAI/Python`, and bare `node` user-agents, while accepting official CLI user-agents and pi's `pi (<os> <release>; <arch>)`.
