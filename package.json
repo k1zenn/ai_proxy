@@ -1,0 +1,34 @@
+{
+  "name": "ai-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Zero-dependency reverse proxy that repairs dropped thinking/reasoning blocks for Anthropic- and OpenAI-compatible AI gateways",
+  "keywords": [
+    "proxy",
+    "llm",
+    "anthropic",
+    "openai",
+    "reasoning",
+    "thinking",
+    "claude-code",
+    "new-api",
+    "agentrouter",
+    "litellm"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/k1zenn/ai_proxy.git"
+  },
+  "bin": {
+    "ai-proxy": "./server.mjs"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node test/proxy.test.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

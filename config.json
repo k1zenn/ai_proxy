@@ -1,0 +1,9 @@
+{
+  "upstream": "https://agentrouter.org",
+  "host": "127.0.0.1",
+  "port": 8787,
+  "log": true,
+  "fallbackDisableThinking": true,
+  "disableThinking": false,
+  "cacheSize": 5000
+}

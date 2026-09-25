@@ -1,0 +1,18 @@
+# Dependencies (none required, but present if you npm-install for tooling)
+node_modules/
+
+# Runtime artifacts
+*.log
+proxy.log
+proxy.pid
+config.local.json
+.env
+.env.*
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+*:Zone.Identifier
+*.swp
+.idea/
+.vscode/
