@@ -25,6 +25,9 @@
  *   3. On the thinking error, retries with the missing blocks re-injected.
  *   4. If unrecoverable (e.g. proxy restarted), retries with thinking/
  *      reasoning disabled so the request still succeeds.
+ *   5. Never gives up: on a thinking error, 5xx, or connect failure the
+ *      attempt plan wraps around and retries forever. Only a definitive
+ *      4xx that is not the thinking error is ever returned to the client.
  *
  * It speaks both dialects:
  *   - Anthropic Messages:  POST /v1/messages
@@ -578,6 +581,10 @@ const serialize = (attempt, rawBody) =>
  * The plan is the normal attempt sequence (original -> repair -> strip) with the
  * most-degraded attempt (usually "strip") repeated at the end, so a transient
  * failure just advances to the next plan item and retries.
+ *
+ * The plan itself is finite, but the caller cycles it indefinitely: when the
+ * last item fails on a retryable error the plan starts over (labels get a
+ * `+cycleN` suffix), so a request never hard-fails on a transient error.
  */
 function buildRetryPlan(attempts, retryAttempts) {
   const plan = attempts.slice();
@@ -634,19 +641,32 @@ const server = http.createServer(async (req, res) => {
   const attempts = buildAttempts(rawBody, json, req.url);
   const plan = buildRetryPlan(attempts, RETRY_ATTEMPTS);
 
-  for (let i = 0; i < plan.length; i++) {
-    const attempt = plan[i];
-    const last = i === plan.length - 1;
+  // Retry forever: when the plan is exhausted it wraps around and starts
+  // over (labels get a `+cycleN` suffix). Only a definitive client error —
+  // a 4xx that is *not* the thinking error — is ever returned to the client.
+  let clientGone = false;
+  res.on('close', () => {
+    if (!res.writableEnded) clientGone = true;
+  });
+
+  const labelAt = (idx) => {
+    const cycle = Math.floor(idx / plan.length);
+    const base = plan[idx % plan.length].label;
+    return cycle > 0 ? `${base}+cycle${cycle}` : base;
+  };
+
+  for (let i = 0; !clientGone; i++) {
+    const attempt = plan[i % plan.length];
+    const label = labelAt(i);
     let upstream;
     try {
       upstream = await callUpstream(req, serialize(attempt, rawBody));
     } catch (err) {
-      log(`[${req.method} ${req.url}] attempt "${attempt.label}" upstream error:`, err.message);
-      if (last) {
-        res.writeHead(502, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ error: { type: 'proxy_error', message: `upstream fetch failed: ${err.message}` } }));
-        return;
-      }
+      log(
+        `[${req.method} ${req.url}] attempt "${label}" upstream error:`,
+        err.message,
+        `; retrying as "${labelAt(i + 1)}"`,
+      );
       await sleep(RETRY_DELAY_MS);
       continue;
     }
@@ -662,16 +682,16 @@ const server = http.createServer(async (req, res) => {
       // fires on the exact path the user hits.
       const thinkingError = THINKING_ERROR_RE.test(text);
       // 5xx and the thinking error are both channel-dependent and transient on
-      // these gateways, so keep moving through the retry plan. A non-JSON 5xx
-      // (e.g. an HTML error page) is retried too.
+      // these gateways, so keep retrying — the plan cycles forever. A non-JSON
+      // 5xx (e.g. an HTML error page) is retried too.
       const retryable = upstream.status >= 500 || thinkingError;
-      if (retryable && !last) {
+      if (retryable) {
         const why = thinkingError ? 'thinking error' : `HTTP ${upstream.status}`;
-        log(`[${req.method} ${req.url}] attempt "${attempt.label}" -> ${why}; retrying as "${plan[i + 1].label}"`);
+        log(`[${req.method} ${req.url}] attempt "${label}" -> ${why}; retrying as "${labelAt(i + 1)}"`);
         await sleep(RETRY_DELAY_MS);
         continue;
       }
-      log(`[${req.method} ${req.url}] attempt "${attempt.label}" -> ${upstream.status} (${Date.now() - started}ms)`);
+      log(`[${req.method} ${req.url}] attempt "${label}" -> ${upstream.status} (${Date.now() - started}ms)`);
       forwardBuffered(res, upstream, text);
       return;
     }
@@ -683,15 +703,18 @@ const server = http.createServer(async (req, res) => {
       } catch {
         /* ignore */
       }
-      log(`[${req.method} ${req.url}] attempt "${attempt.label}" -> ${upstream.status} (${Date.now() - started}ms)`);
+      log(`[${req.method} ${req.url}] attempt "${label}" -> ${upstream.status} (${Date.now() - started}ms)`);
       forwardBuffered(res, upstream, text);
       return;
     }
 
-    log(`[${req.method} ${req.url}] attempt "${attempt.label}" -> ${upstream.status} stream (${Date.now() - started}ms)`);
+    log(`[${req.method} ${req.url}] attempt "${label}" -> ${upstream.status} stream (${Date.now() - started}ms)`);
     await streamAndCapture(upstream, res);
     return;
   }
+
+  // Only reachable if the client disconnected mid-retry: stop cleanly.
+  if (!res.writableEnded) res.destroy();
 });
 
 server.on('clientError', (err, socket) => {
@@ -703,7 +726,7 @@ server.listen(PORT, HOST, () => {
   console.log(`thinking-fix-proxy listening on http://${HOST}:${actualPort}`);
   console.log(`  upstream : ${UPSTREAM}`);
   console.log(`  fallback : ${FALLBACK_DISABLE_THINKING ? 'disable thinking on failure' : 'off'}`);
-  console.log(`  retries  : ${RETRY_ATTEMPTS} (delay ${RETRY_DELAY_MS}ms) on thinking error / 5xx`);
+  console.log(`  retries  : unlimited (delay ${RETRY_DELAY_MS}ms; plan cycles forever on thinking error / 5xx / connect failure)`);
   console.log(`  dialects : anthropic /v1/messages + openai /v1/chat/completions`);
   if (DISABLE_THINKING) console.log('  mode     : DISABLE_THINKING always on');
 });

@@ -221,6 +221,11 @@ function startFlakyUpstream(sequence) {
         res.end(`event: error\ndata: ${JSON.stringify({ error: { type: 'invalid_request_error', message: THINKING_ERROR } })}\n\n`);
         return;
       }
+      if (step === '402') {
+        res.writeHead(402, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ message: 'insufficient quota', type: 'billing_error' }));
+        return;
+      }
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(
         JSON.stringify({
@@ -414,6 +419,49 @@ async function main() {
         const r = await post(retryProxy.port, '/v1/chat/completions', openaiReplayFollowUp('call_sse_1'));
         assert.equal(r.status, 200, 'SSE-framed thinking error is retried -> 200');
         assert.ok(flaky.seen.length >= 2, 'retried after SSE thinking error');
+      } finally {
+        retryProxy.child.kill('SIGTERM');
+        flaky.server.close();
+      }
+    }
+
+    // Endless failure: the retry plan must wrap around instead of running
+    // out. Six thinking errors exceed the plan (4 items with
+    // RETRY_ATTEMPTS=1), so only the +cycle wrap can reach the eventual 200.
+    {
+      const flaky = await startFlakyUpstream([
+        'thinking',
+        'thinking',
+        'thinking',
+        'thinking',
+        'thinking',
+        'thinking',
+        '200',
+      ]);
+      const retryProxy = await startProxy(flaky.port, { RETRY_ATTEMPTS: '1', RETRY_DELAY_MS: '0' });
+      try {
+        const r = await post(retryProxy.port, '/v1/chat/completions', openaiReplayFollowUp('call_endless_1'));
+        assert.equal(r.status, 200, 'retries never stop: plan cycles until 200');
+        assert.equal(flaky.seen.length, 7, `wrapped past plan length (saw ${flaky.seen.length} attempts)`);
+        // Plan length is 3 (original, strip, strip+retry1), so request #4 only
+        // exists because the plan wrapped around to cycle 1's "original".
+        assert.equal(flaky.seen[3].reasoning_effort, undefined, 'plan wrapped back to "original"');
+        assert.equal(flaky.seen[4].reasoning_effort, 'none', 'cycle 1 continued with the stripped attempt');
+      } finally {
+        retryProxy.child.kill('SIGTERM');
+        flaky.server.close();
+      }
+    }
+
+    // A definitive client error (a 4xx that is not the thinking error) must
+    // still be forwarded immediately — never retried forever.
+    {
+      const flaky = await startFlakyUpstream(['402', '200']);
+      const retryProxy = await startProxy(flaky.port, { RETRY_ATTEMPTS: '5', RETRY_DELAY_MS: '0' });
+      try {
+        const r = await post(retryProxy.port, '/v1/chat/completions', openaiReplayFollowUp('call_bill_1'));
+        assert.equal(r.status, 402, 'non-retryable 4xx forwarded as-is');
+        assert.equal(flaky.seen.length, 1, 'non-retryable 4xx was not retried');
       } finally {
         retryProxy.child.kill('SIGTERM');
         flaky.server.close();
