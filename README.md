@@ -67,8 +67,9 @@ You cannot fix this on the client side, and you cannot ask the gateway to stop d
 1. **Forwards every request untouched** — streaming (SSE) and non-streaming, both dialects, all headers and the client's API key preserved.
 2. **Captures thinking as it streams by.** It parses responses and stores `thinking` / `redacted_thinking` blocks (Anthropic) and `reasoning_content` (OpenAI) in an in-memory LRU cache, keyed by `tool_use` / `tool_call` id.
 3. **On the thinking error, retries automatically** after re-injecting the missing blocks into the matching assistant turns — original text *and signature* preserved.
-4. **If the blocks can't be recovered** (e.g. the proxy restarted between turns), it retries once with thinking/reasoning disabled so the request still succeeds instead of hard-failing.
-5. **`DISABLE_THINKING=1`** strips thinking from every request up front (brute-force mode).
+4. **If the blocks can't be recovered** (e.g. the proxy restarted between turns), it retries with thinking/reasoning **explicitly disabled** (`thinking: {type:"disabled"}` / `reasoning_effort: "none"`), so the request still succeeds instead of hard-failing. Just deleting the fields is not enough — models like `claude-opus-5` think by default.
+5. **Retries transient upstream failures.** Gateways such as AgentRouter load-balance across several channels, so the *same* request can randomly return `200`, the thinking `400`, or a `500`. The proxy retries the most-degraded attempt (`RETRY_ATTEMPTS`, default 5) before giving up, which turns an intermittent failure into a normal response.
+6. **`DISABLE_THINKING=1`** strips thinking from every request up front (brute-force mode).
 
 When no repair is needed the proxy is a transparent passthrough.
 
@@ -224,6 +225,8 @@ Resolution order: **environment variable → `config.json` → built-in default.
 | `FALLBACK_DISABLE_THINKING` | `fallbackDisableThinking` | `true` | Retry with thinking disabled on an unrecoverable thinking error |
 | `DISABLE_THINKING` | `disableThinking` | `false` | Always strip thinking/reasoning from requests |
 | `CACHE_SIZE` | `cacheSize` | `5000` | Max cached `id → thinking` entries in the LRU |
+| `RETRY_ATTEMPTS` | `retryAttempts` | `5` | Extra retries of the most-degraded attempt on a thinking error / `5xx` (covers flaky multi-channel gateways) |
+| `RETRY_DELAY_MS` | `retryDelayMs` | `400` | Delay between retries, in milliseconds |
 | `MAX_BODY` | `maxBody` | `67108864` | Max request body size in bytes (64 MiB) |
 | `LOG` | `log` | `true` | Request/attempt logging |
 | `CONFIG` | — | `./config.json` | Alternate config file path |
@@ -238,7 +241,9 @@ Default `config.json`:
   "log": true,
   "fallbackDisableThinking": true,
   "disableThinking": false,
-  "cacheSize": 5000
+  "cacheSize": 5000,
+  "retryAttempts": 5,
+  "retryDelayMs": 400
 }
 ```
 
@@ -256,6 +261,9 @@ UPSTREAM_API_KEY=sk-... node server.mjs
 
 # nuke thinking on every request
 DISABLE_THINKING=1 node server.mjs
+
+# tolerate a very flaky gateway
+RETRY_ATTEMPTS=8 RETRY_DELAY_MS=250 node server.mjs
 ```
 
 ## Run as a service
@@ -296,8 +304,14 @@ WantedBy=default.target
 ```bash
 systemctl --user daemon-reload
 systemctl --user enable --now ai-proxy
+loginctl enable-linger "$USER"        # start on boot even without an interactive login
 journalctl --user -u ai-proxy -f
 ```
+
+`enable-linger` matters: a user service is otherwise stopped at logout and is
+not started after a reboot until you log in again — which is exactly how the
+proxy goes missing between tool-calling turns and the "thinking must be passed
+back" error comes back.
 
 ### WSL / container note
 
@@ -322,14 +336,18 @@ Log lines look like this — note the attempt labels:
 ```
 2026-01-01T00:00:00.000Z [POST /v1/messages] attempt "original" -> thinking error; retrying as "repair-thinking"
 2026-01-01T00:00:00.123Z [POST /v1/messages] attempt "repair-thinking" -> 200
-2026-01-01T00:00:01.000Z [POST /v1/chat/completions] attempt "original" -> 200 stream (919ms)
+2026-01-01T00:00:01.000Z [POST /v1/chat/completions] attempt "original" -> HTTP 500; retrying as "strip-reasoning"
+2026-01-01T00:00:01.400Z [POST /v1/chat/completions] attempt "strip-reasoning" -> thinking error; retrying as "strip-reasoning+retry1"
+2026-01-01T00:00:01.800Z [POST /v1/chat/completions] attempt "strip-reasoning+retry1" -> 200
+2026-01-01T00:00:02.000Z [POST /v1/chat/completions] attempt "original" -> 200 stream (919ms)
 ```
 
 | Attempt label | Meaning |
 | --- | --- |
 | `original` | Request forwarded byte-for-byte |
 | `repair-thinking` / `repair-reasoning` | Missing blocks were recovered from cache and re-injected |
-| `strip-thinking` / `strip-reasoning` | Fallback: thinking/reasoning removed so the call can succeed |
+| `strip-thinking` / `strip-reasoning` | Fallback: thinking/reasoning **explicitly disabled** so the call can succeed |
+| `…+retryN` | A transient thinking error / `5xx` was retried (flaky gateway channel) |
 | `force-strip` | `DISABLE_THINKING=1` is on |
 | `raw` / `empty` | Non-JSON body (tunnelled untouched) |
 
@@ -339,7 +357,7 @@ Log lines look like this — note the attempt labels:
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| `400 content[].thinking ... must be passed back` keeps appearing | Cache was empty (proxy restarted mid-conversation) and the fallback did not recover it | Keep the proxy alive across turns, or set `DISABLE_THINKING=1`, or raise `CACHE_SIZE` |
+| `400 content[].thinking ... must be passed back` keeps appearing | Either the cache was empty (proxy restarted mid-conversation), the gateway cannot round-trip thinking at all (see below), **or the gateway is load-balancing to a strict channel** | Keep the proxy alive across turns, make sure the proxy is the one in the request path, and raise `RETRY_ATTEMPTS` if the gateway is flaky. `DISABLE_THINKING=1` forces it off |
 | `422 ... unknown variant 'developer'` | Your client sent the OpenAI `developer` role; the gateway only accepts `system` | Set `compat.supportsDeveloperRole: false` (pi) or the equivalent for your client |
 | `401 unauthorized client detected` | The **gateway** fingerprints clients and blocks yours. Common with `curl`, `python`, and generic `node` user-agents | The proxy forwards your client's `User-Agent`, so use the client the gateway expects; do not diagnose with `curl` |
 | `502 upstream fetch failed` | DNS/network/TLS problem reaching `UPSTREAM` | Check `UPSTREAM` and connectivity |
@@ -349,7 +367,7 @@ Log lines look like this — note the attempt labels:
 
 ## Provider gotchas
 
-These are upstream behaviors that the proxy deliberately does **not** paper over, because they are not protocol bugs and silently masking them would hide real misconfiguration.
+These are upstream behaviors that the proxy deliberately does **not** paper over, because they are not protocol bugs and silently masking them would hide real misconfiguration. The one exception is transient channel flakiness, which the retry plan does absorb.
 
 ### Client fingerprinting
 
@@ -362,6 +380,55 @@ Some gateways reject requests based on the client's `User-Agent` (and, less ofte
 for `curl`, `OpenAI/Python`, and bare `node` user-agents, while accepting official CLI user-agents and pi's `pi (<os> <release>; <arch>)`.
 
 The proxy **forwards your client's headers unchanged**, so a permitted client stays permitted. Because a `curl` test will often be rejected, always validate with the client you actually intend to use.
+
+### OpenAI clients + Claude models + new-api/one-api: thinking cannot be replayed
+
+This is the case the explicit-disable fallback exists for. Gateways such as
+[QuantumNous/new-api](https://github.com/QuantumNous/new-api) expose upstream
+Claude thinking to OpenAI clients as `reasoning_content`, but their
+OpenAI→Claude **request** translator never reads `reasoning_content` back into
+a signed `thinking` block. The round trip is lossy in one direction only:
+
+```
+Claude thinking  ──►  reasoning_content        (response path: works)
+reasoning_content ──►  ???                      (request path: dropped)
+```
+
+So re-injecting `reasoning_content` cannot satisfy Anthropic, and a follow-up
+tool turn fails even though the client played its part correctly. The only
+reliable repair through the OpenAI dialect is to turn thinking off, which the
+proxy does by sending `reasoning_effort: "none"`.
+
+If you want to keep thinking on for Claude models, point the client at the
+gateway's **Anthropic Messages** endpoint instead (`anthropic-messages` in pi,
+or `ANTHROPIC_BASE_URL` for Claude Code). There the client replays the signed
+`thinking` blocks itself and the gateway passes them through untouched; the
+proxy then acts as a pure passthrough.
+
+### Flaky multi-channel gateways (AgentRouter and friends)
+
+Some gateways front several upstream channels behind one endpoint and pick one
+per request. The channels disagree about thinking: one accepts the request,
+another demands the thinking block be replayed, and a third may be briefly
+unavailable. The result is that the **same** request randomly returns `200`, the
+thinking `400`, or a `500`:
+
+```
+POST /v1/chat/completions  ->  200
+POST /v1/chat/completions  ->  400  content[].thinking must be passed back
+POST /v1/chat/completions  ->  500  Service temporarily unavailable
+```
+
+This is not something a client can observe or fix, and a single fallback is not
+enough because the retry can land on another bad channel. The proxy therefore
+keeps retrying the most-degraded attempt (`RETRY_ATTEMPTS`, default 5). The
+surface error only ever appears if *every* retry happens to hit a bad channel.
+
+One extra trap makes this look unfixable: when the client streams (`stream:
+true`, as pi does), the gateway frames the thinking error as
+`text/event-stream` rather than JSON. A proxy that only inspects JSON error
+bodies will forward it untouched. This proxy matches the error message in
+either framing.
 
 ### `developer` vs `system` role
 
@@ -406,12 +473,16 @@ Some gateways return `reasoning_content` even when the client never asked for re
 - OpenAI: `original` → `repair-reasoning` → `strip-reasoning`
 - Only attempts that actually change the body are included.
 
+The retry plan (`buildRetryPlan`) then appends `RETRY_ATTEMPTS` copies of the
+last attempt (e.g. `strip-reasoning+retry1`…), so a transient thinking error or
+`5xx` simply advances to the next item.
+
 **Capture** (`StreamCollector`) handles both dialects at once and works on SSE and on buffered JSON:
 
 - Anthropic: `content_block_start` creates a block keyed by index; `thinking_delta` / `signature_delta` accumulate into it; `tool_use` blocks provide the cache key.
 - OpenAI: `choices[].delta.reasoning_content` / `delta.reasoning` accumulate; `delta.tool_calls[].id` provides the cache key.
 
-**Retry** only triggers when the upstream returns a `4xx` JSON body matching the thinking-error pattern, and only while attempts remain. Errors the proxy does not recognise are forwarded verbatim.
+**Retry** triggers when the upstream returns a `5xx`, or a `4xx` body matching the thinking-error pattern, while attempts remain in the retry plan. The error is matched by its message rather than its content-type, because for a streaming request (`stream: true`, which is what pi sends) AgentRouter frames it as `text/event-stream` instead of JSON — the case that previously slipped straight through to the client. Errors the proxy does not recognise are forwarded verbatim.
 
 ## Tests
 
@@ -427,7 +498,10 @@ The test spins up a mock gateway that reproduces the exact `400` on **both** dia
 - Anthropic continuation with an unknown tool id → `200`, `thinking` stripped (fallback).
 - OpenAI first turn → `200`, `reasoning_content` present in the response.
 - OpenAI continuation → `200`, `reasoning_content` re-injected.
-- OpenAI continuation with an unknown tool call id → `200`, `reasoning_effort` stripped (fallback).
+- OpenAI continuation with an unknown tool call id → `200`, `reasoning_effort: "none"` (fallback).
+- OpenAI continuation against a strict gateway that drops `reasoning_content` → `200` only because thinking is explicitly disabled.
+- OpenAI continuation that replays `reasoning_content` with no `reasoning_effort` (pi's real shape) against the strict gateway → `200`, reasoning disabled.
+- A flaky gateway that returns `500` → thinking `400` → `500` → `200` → `200`, proving the retry plan survives channel-dependent failures.
 
 No network access and no API keys are required.
 
@@ -446,8 +520,8 @@ No network access and no API keys are required.
 - **Repair requires a prior captured turn in the same process.** It cannot invent a signature.
 - **Message history rewriting is heuristic.** Blocks are matched by `tool_use` / `tool_call` id; exotic dialects may not match.
 - **Only request/response JSON is inspected.** Multipart and non-JSON bodies are tunnelled untouched.
-- **No request queueing, rate limiting, or retries on `5xx`** (only the thinking-error retry path exists).
-- **The fallback removes reasoning**, so the model may produce a lower-quality answer than a successful repair. It exists to keep you moving, not to be ideal.
+- **No request queueing or rate limiting.** Transient thinking errors and `5xx` are retried (`RETRY_ATTEMPTS`), but there is no general retry/backoff policy beyond that.
+- **The fallback disables reasoning**, so the model may produce a lower-quality answer than a successful repair. It exists to keep you moving, not to be ideal. For Claude models behind new-api this is the only repair that works over the OpenAI dialect (see [Provider gotchas](#provider-gotchas)).
 
 ## FAQ
 

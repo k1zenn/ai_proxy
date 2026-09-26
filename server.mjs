@@ -72,12 +72,16 @@ const UPSTREAM_API_KEY = pick('UPSTREAM_API_KEY', 'upstreamApiKey', '');
 const FALLBACK_DISABLE_THINKING = asBool(pick('FALLBACK_DISABLE_THINKING', 'fallbackDisableThinking', true));
 const DISABLE_THINKING = asBool(pick('DISABLE_THINKING', 'disableThinking', false));
 const CACHE_SIZE = parseInt(pick('CACHE_SIZE', 'cacheSize', '5000'), 10);
+const RETRY_ATTEMPTS = parseInt(pick('RETRY_ATTEMPTS', 'retryAttempts', '5'), 10);
+const RETRY_DELAY_MS = parseInt(pick('RETRY_DELAY_MS', 'retryDelayMs', '400'), 10);
 const LOG = asBool(pick('LOG', 'log', true));
 const MAX_BODY = parseInt(pick('MAX_BODY', 'maxBody', String(64 * 1024 * 1024)), 10);
 
 const log = (...args) => {
   if (LOG) console.log(new Date().toISOString(), ...args);
 };
+
+const sleep = (ms) => (ms > 0 ? new Promise((r) => setTimeout(r, ms)) : Promise.resolve());
 
 // ---------------------------------------------------------------------------
 // Thinking cache: id -> array of thinking / redacted_thinking blocks (or
@@ -402,12 +406,20 @@ function repairAnthropicRequest(body) {
   return { obj: out, changed };
 }
 
-/** Remove thinking entirely so the request is no longer in "thinking mode". */
+/**
+ * Force the request out of "thinking mode".
+ *
+ * Deleting the `thinking` field is NOT enough. Models such as claude-opus-5
+ * think by default, so a request without `thinking` is still in thinking mode
+ * and the upstream keeps demanding the historical thinking blocks. Sending an
+ * explicit `thinking: { type: "disabled" }` is what actually turns it off and
+ * drops that requirement.
+ */
 function stripThinking(body) {
   const out = structuredClone(body);
   let changed = false;
-  if (out.thinking !== undefined) {
-    delete out.thinking;
+  if (out.thinking === undefined || out.thinking.type !== 'disabled') {
+    out.thinking = { type: 'disabled' };
     changed = true;
   }
   if (Array.isArray(out.messages)) {
@@ -458,18 +470,42 @@ function repairOpenAIRequest(body) {
   return { obj: out, changed };
 }
 
-/** Remove reasoning hints so a reasoning model call can still go through. */
+/**
+ * Force the request out of "thinking mode" for the OpenAI dialect.
+ *
+ * Removing `reasoning_effort` / `reasoning_content` does NOT disable thinking
+ * on gateways (new-api, one-api, LiteLLM) that translate an OpenAI chat
+ * request into Anthropic Messages: their Claude models think by default, and
+ * they only disable it when the client explicitly asks for
+ * `reasoning_effort: "none"`. Worse, those gateways expose upstream thinking
+ * to OpenAI clients as `reasoning_content`, but never translate it back into
+ * a signed `thinking` block on the way in, so replaying it cannot satisfy the
+ * upstream. Turning thinking off is therefore the only reliable fallback.
+ */
 function stripOpenAIReasoning(body) {
   const out = structuredClone(body);
   let changed = false;
+
+  // Explicit off switch. Gateways map this to `thinking: {type:"disabled"}`.
+  if (out.reasoning_effort !== 'none') {
+    out.reasoning_effort = 'none';
+    changed = true;
+  }
+
+  // Non-standard reasoning controls some gateways honour (zai / OpenRouter).
   if (out.thinking !== undefined) {
     delete out.thinking;
     changed = true;
   }
-  if (out.reasoning_effort !== undefined) {
-    delete out.reasoning_effort;
+  if (out.reasoning !== undefined) {
+    delete out.reasoning;
     changed = true;
   }
+  if (out.enable_thinking !== undefined) {
+    out.enable_thinking = false;
+    changed = true;
+  }
+
   if (Array.isArray(out.messages)) {
     for (const msg of out.messages) {
       if (!msg || msg.role !== 'assistant') continue;
@@ -481,6 +517,19 @@ function stripOpenAIReasoning(body) {
       }
     }
   }
+
+  // A model-name alias such as `claude-opus-5-thinking` re-enables thinking on
+  // gateways (new-api) after the request fields are read, overriding the
+  // explicit "none". Drop the alias so the disable actually wins. The base
+  // model id is left untouched, so this is safe for the common case.
+  if (typeof out.model === 'string') {
+    const base = out.model.replace(/-thinking(?:-\d+)?$/, '');
+    if (base && base !== out.model) {
+      out.model = base;
+      changed = true;
+    }
+  }
+
   return { obj: out, changed };
 }
 
@@ -520,6 +569,26 @@ function buildAttempts(rawBody, json, path) {
 
 const serialize = (attempt, rawBody) =>
   attempt.body === null || attempt.body === undefined ? rawBody : Buffer.from(JSON.stringify(attempt.body), 'utf8');
+
+/**
+ * Gateways such as AgentRouter load-balance across several upstream channels
+ * with different behaviour: the *same* request can randomly come back 200, with
+ * the thinking error, or with a 5xx. A single retry is therefore not enough.
+ *
+ * The plan is the normal attempt sequence (original -> repair -> strip) with the
+ * most-degraded attempt (usually "strip") repeated at the end, so a transient
+ * failure just advances to the next plan item and retries.
+ */
+function buildRetryPlan(attempts, retryAttempts) {
+  const plan = attempts.slice();
+  const final = plan[plan.length - 1];
+  if (final && retryAttempts > 0) {
+    for (let i = 1; i <= retryAttempts; i++) {
+      plan.push({ label: `${final.label}+retry${i}`, body: final.body });
+    }
+  }
+  return plan;
+}
 
 // ---------------------------------------------------------------------------
 // Upstream call
@@ -563,30 +632,43 @@ const server = http.createServer(async (req, res) => {
   }
 
   const attempts = buildAttempts(rawBody, json, req.url);
+  const plan = buildRetryPlan(attempts, RETRY_ATTEMPTS);
 
-  for (let i = 0; i < attempts.length; i++) {
-    const attempt = attempts[i];
-    const last = i === attempts.length - 1;
+  for (let i = 0; i < plan.length; i++) {
+    const attempt = plan[i];
+    const last = i === plan.length - 1;
     let upstream;
     try {
       upstream = await callUpstream(req, serialize(attempt, rawBody));
     } catch (err) {
-      log(`[${req.method} ${req.url}] upstream error:`, err.message);
+      log(`[${req.method} ${req.url}] attempt "${attempt.label}" upstream error:`, err.message);
       if (last) {
         res.writeHead(502, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ error: { type: 'proxy_error', message: `upstream fetch failed: ${err.message}` } }));
         return;
       }
+      await sleep(RETRY_DELAY_MS);
       continue;
     }
 
     const ct = String(upstream.headers.get('content-type') || '');
     const isJson = ct.includes('application/json') || ct.includes('text/json');
 
-    if (upstream.status >= 400 && isJson) {
+    if (upstream.status >= 400) {
       const text = await upstream.text();
-      if (THINKING_ERROR_RE.test(text) && !last) {
-        log(`[${req.method} ${req.url}] attempt "${attempt.label}" -> thinking error; retrying as "${attempts[i + 1].label}"`);
+      // Gateways return this error as JSON, but for a streaming request
+      // (`stream: true`, as pi sends) AgentRouter emits it as a text/event-stream
+      // body. Match the message regardless of content-type, or the retry never
+      // fires on the exact path the user hits.
+      const thinkingError = THINKING_ERROR_RE.test(text);
+      // 5xx and the thinking error are both channel-dependent and transient on
+      // these gateways, so keep moving through the retry plan. A non-JSON 5xx
+      // (e.g. an HTML error page) is retried too.
+      const retryable = upstream.status >= 500 || thinkingError;
+      if (retryable && !last) {
+        const why = thinkingError ? 'thinking error' : `HTTP ${upstream.status}`;
+        log(`[${req.method} ${req.url}] attempt "${attempt.label}" -> ${why}; retrying as "${plan[i + 1].label}"`);
+        await sleep(RETRY_DELAY_MS);
         continue;
       }
       log(`[${req.method} ${req.url}] attempt "${attempt.label}" -> ${upstream.status} (${Date.now() - started}ms)`);
@@ -621,6 +703,7 @@ server.listen(PORT, HOST, () => {
   console.log(`thinking-fix-proxy listening on http://${HOST}:${actualPort}`);
   console.log(`  upstream : ${UPSTREAM}`);
   console.log(`  fallback : ${FALLBACK_DISABLE_THINKING ? 'disable thinking on failure' : 'off'}`);
+  console.log(`  retries  : ${RETRY_ATTEMPTS} (delay ${RETRY_DELAY_MS}ms) on thinking error / 5xx`);
   console.log(`  dialects : anthropic /v1/messages + openai /v1/chat/completions`);
   if (DISABLE_THINKING) console.log('  mode     : DISABLE_THINKING always on');
 });
