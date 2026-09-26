@@ -83,6 +83,11 @@ cd ai_proxy
 ./run.sh          # or: node server.mjs
 ```
 
+`./run.sh` is a foreground runner: **Ctrl+C stops it and frees the port.** If
+the port is already held — by the systemd unit below, or by a proxy left over
+from an earlier terminal — `run.sh` stops that process first, so you never have
+to hunt for a PID. Anything else on the port is reported and left untouched.
+
 You should see:
 
 ```
@@ -313,6 +318,10 @@ not started after a reboot until you log in again — which is exactly how the
 proxy goes missing between tool-calling turns and the "thinking must be passed
 back" error comes back.
 
+> **`run.sh` and the systemd unit share one port.** Running `./run.sh` stops the
+> `ai-proxy` unit first, and Ctrl+C leaves it stopped. If you want the
+> always-on service back, run `systemctl --user start ai-proxy`.
+
 ### WSL / container note
 
 If the client runs **on Windows** while the proxy runs **inside WSL**, bind `0.0.0.0` and use the WSL IP (or `localhost` with WSL2 localhost forwarding):
@@ -362,6 +371,7 @@ Log lines look like this — note the attempt labels:
 | `401 unauthorized client detected` | The **gateway** fingerprints clients and blocks yours. Common with `curl`, `python`, and generic `node` user-agents | The proxy forwards your client's `User-Agent`, so use the client the gateway expects; do not diagnose with `curl` |
 | `502 upstream fetch failed` | DNS/network/TLS problem reaching `UPSTREAM` | Check `UPSTREAM` and connectivity |
 | `413 request body too large` | Body exceeded `MAX_BODY` | Raise `MAX_BODY` |
+| `EADDRINUSE` / `address already in use` from `run.sh` | The port is held by the systemd `ai-proxy` unit or a previous proxy | Use `./run.sh` (it stops those automatically) or `PORT=8788 ./run.sh`; `node server.mjs` on its own does not take over the port |
 | Health check works but requests fail | Auth/upstream issue, not the proxy | Run with `LOG=1` and read the attempt lines |
 | `/v1/models` returns `401` but completions work | Some gateways restrict the models endpoint for limited keys | Ignore it; use a real completion as your check |
 

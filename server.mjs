@@ -707,3 +707,17 @@ server.listen(PORT, HOST, () => {
   console.log(`  dialects : anthropic /v1/messages + openai /v1/chat/completions`);
   if (DISABLE_THINKING) console.log('  mode     : DISABLE_THINKING always on');
 });
+
+// Graceful shutdown: close the listener, stop accepting, then exit. A force
+// exit guards against long-lived keep-alive connections holding us open.
+let shuttingDown = false;
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.on(signal, () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    log(`received ${signal}, shutting down`);
+    const force = setTimeout(() => process.exit(0), 2000);
+    force.unref();
+    server.close(() => process.exit(0));
+  });
+}
