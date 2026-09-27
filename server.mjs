@@ -25,9 +25,10 @@
  *   3. On the thinking error, retries with the missing blocks re-injected.
  *   4. If unrecoverable (e.g. proxy restarted), retries with thinking/
  *      reasoning disabled so the request still succeeds.
- *   5. Never gives up: on a thinking error, 5xx, or connect failure the
- *      attempt plan wraps around and retries forever. Only a definitive
- *      4xx that is not the thinking error is ever returned to the client.
+ *   5. Never gives up: on a thinking error, 5xx, WAF block pages, or connect
+ *      failure the attempt plan wraps around and retries forever. Only a
+ *      definitive 4xx that is not the thinking error / block page is ever
+ *      returned to the client.
  *
  * It speaks both dialects:
  *   - Anthropic Messages:  POST /v1/messages
@@ -120,6 +121,21 @@ const thinkingCache = new LRU(CACHE_SIZE);
 // ---------------------------------------------------------------------------
 const THINKING_ERROR_RE =
   /content\[\]\.thinking|thinking mode must be passed back|must be passed back to the api|reasoning_content.*must be passed back/i;
+
+// WAF/CDN block pages. Aliyun WAF (mark its edge with the `acw_tc` cookie)
+// answers a blocked request with HTTP 405 + an HTML page
+// containing "Sorry, your request has been blocked" / "您的访问被阻断" and a
+// traceid — NOT a real "Method Not Allowed". Cloudflare uses 403 + "you have
+// been blocked". These are payload/URL/rate dependent and edge dependent, so
+// they are transient: retry them like a 5xx instead of forwarding HTML the
+// client cannot parse.
+const WAF_BLOCK_RE =
+  /your request has been blocked|访问被阻断|you have been blocked|errors\.aliyun\.com/i;
+
+const wafTraceId = (text) => {
+  const m = text.match(/"traceid"\s*:\s*"([0-9a-f]+)"/i);
+  return m ? m[1] : '';
+};
 
 const isThinkingBlock = (b) => b && (b.type === 'thinking' || b.type === 'redacted_thinking');
 
@@ -681,12 +697,21 @@ const server = http.createServer(async (req, res) => {
       // body. Match the message regardless of content-type, or the retry never
       // fires on the exact path the user hits.
       const thinkingError = THINKING_ERROR_RE.test(text);
-      // 5xx and the thinking error are both channel-dependent and transient on
+      // A WAF/CDN block page in front of the gateway is edge- and
+      // payload-dependent (the same request often passes on the next try),
+      // so it is treated as transient exactly like a 5xx.
+      const wafBlock = upstream.status < 500 && WAF_BLOCK_RE.test(text);
+      // 5xx, the thinking error, and WAF block pages are all transient on
       // these gateways, so keep retrying — the plan cycles forever. A non-JSON
       // 5xx (e.g. an HTML error page) is retried too.
-      const retryable = upstream.status >= 500 || thinkingError;
+      const retryable = upstream.status >= 500 || thinkingError || wafBlock;
       if (retryable) {
-        const why = thinkingError ? 'thinking error' : `HTTP ${upstream.status}`;
+        const trace = wafBlock ? wafTraceId(text) : '';
+        const why = thinkingError
+          ? 'thinking error'
+          : wafBlock
+            ? `WAF block page (HTTP ${upstream.status})${trace ? ` trace=${trace}` : ''}`
+            : `HTTP ${upstream.status}`;
         log(`[${req.method} ${req.url}] attempt "${label}" -> ${why}; retrying as "${labelAt(i + 1)}"`);
         await sleep(RETRY_DELAY_MS);
         continue;

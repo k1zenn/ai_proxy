@@ -358,7 +358,7 @@ Log lines look like this — note the attempt labels:
 | `original` | Request forwarded byte-for-byte |
 | `repair-thinking` / `repair-reasoning` | Missing blocks were recovered from cache and re-injected |
 | `strip-thinking` / `strip-reasoning` | Fallback: thinking/reasoning **explicitly disabled** so the call can succeed |
-| `…+retryN` | A transient thinking error / `5xx` was retried (flaky gateway channel) |
+| `…+retryN` | A transient thinking error / `5xx` / WAF block page was retried (flaky gateway channel) |
 | `…+cycleN` | The retry plan wrapped around and restarted — retries never stop |
 | `force-strip` | `DISABLE_THINKING=1` is on |
 | `raw` / `empty` | Non-JSON body (tunnelled untouched) |
@@ -372,6 +372,7 @@ Log lines look like this — note the attempt labels:
 | `400 content[].thinking ... must be passed back` keeps appearing | Either the cache was empty (proxy restarted mid-conversation), the gateway cannot round-trip thinking at all (see below), **or the gateway is load-balancing to a strict channel** | Keep the proxy alive across turns and make sure the proxy is the one in the request path. The proxy already retries forever across channels, so a stuck request means every channel is strict — then set `DISABLE_THINKING=1` to force thinking off up front |
 | `422 ... unknown variant 'developer'` | Your client sent the OpenAI `developer` role; the gateway only accepts `system` | Set `compat.supportsDeveloperRole: false` (pi) or the equivalent for your client |
 | `401 unauthorized client detected` | The **gateway** fingerprints clients and blocks yours. Common with `curl`, `python`, and generic `node` user-agents | The proxy forwards your client's `User-Agent`, so use the client the gateway expects; do not diagnose with `curl` |
+| `405 <!doctype html> ... your request has been blocked` (HTML from `errors.aliyun.com`) | Not a real `405` — a **WAF/CDN block page** in front of the gateway (Aliyun WAF returns `405` for blocked requests; the `acw_tc` cookie marks the Aliyun edge). Caused by WAF rules matching the payload, URL, or request rate | The proxy detects these block pages and retries them like a `5xx` (the log shows `WAF block page (HTTP 405) trace=…`, forward the `trace=` id to the gateway if it persists — it means the WAF is matching your payload, e.g. code snippets, and only the gateway operator can whitelist it) |
 | Request hangs; the log repeats `upstream error: getaddrinfo ENOTFOUND …` | DNS/network/TLS problem reaching `UPSTREAM` | Check `UPSTREAM` and connectivity — the proxy retries connect failures forever, so the client only times out |
 | `413 request body too large` | Body exceeded `MAX_BODY` | Raise `MAX_BODY` |
 | `EADDRINUSE` / `address already in use` from `run.sh` | The port is held by the systemd `ai-proxy` unit or a previous proxy | Use `./run.sh` (it stops those automatically) or `PORT=8788 ./run.sh`; `node server.mjs` on its own does not take over the port |
@@ -488,8 +489,8 @@ Some gateways return `reasoning_content` even when the client never asked for re
 - Only attempts that actually change the body are included.
 
 The retry plan (`buildRetryPlan`) then appends `RETRY_ATTEMPTS` copies of the
-last attempt (e.g. `strip-reasoning+retry1`…), so a transient thinking error or
-`5xx` simply advances to the next item. The plan is finite, but the request loop
+last attempt (e.g. `strip-reasoning+retry1`…), so a transient thinking error,
+`5xx`, or WAF block page simply advances to the next item. The plan is finite, but the request loop
 is not: when it runs out, it wraps around and restarts with `+cycleN` labels,
 retrying until the upstream answers successfully (or the client disconnects).
 
@@ -498,7 +499,7 @@ retrying until the upstream answers successfully (or the client disconnects).
 - Anthropic: `content_block_start` creates a block keyed by index; `thinking_delta` / `signature_delta` accumulate into it; `tool_use` blocks provide the cache key.
 - OpenAI: `choices[].delta.reasoning_content` / `delta.reasoning` accumulate; `delta.tool_calls[].id` provides the cache key.
 
-**Retry** triggers when the upstream returns a `5xx`, fails to connect, or returns a `4xx` body matching the thinking-error pattern. There is no attempt limit — the plan cycles until the upstream answers. The error is matched by its message rather than its content-type, because for a streaming request (`stream: true`, which is what pi sends) AgentRouter frames it as `text/event-stream` instead of JSON — the case that previously slipped straight through to the client. A `4xx` that does not match the pattern is forwarded verbatim.
+**Retry** triggers when the upstream returns a `5xx`, fails to connect, returns a `4xx` body matching the thinking-error pattern, or returns a `4xx` WAF block page (e.g. Aliyun WAF's `405` HTML page — `WAF_BLOCK_RE`, see below). There is no attempt limit — the plan cycles until the upstream answers. The error is matched by its message rather than its content-type, because for a streaming request (`stream: true`, which is what pi sends) AgentRouter frames it as `text/event-stream` instead of JSON — the case that previously slipped straight through to the client. A `4xx` that does not match either pattern is forwarded verbatim.
 
 ## Tests
 
@@ -538,7 +539,7 @@ No network access and no API keys are required.
 - **Repair requires a prior captured turn in the same process.** It cannot invent a signature.
 - **Message history rewriting is heuristic.** Blocks are matched by `tool_use` / `tool_call` id; exotic dialects may not match.
 - **Only request/response JSON is inspected.** Multipart and non-JSON bodies are tunnelled untouched.
-- **No request queueing, rate limiting, or backoff.** Thinking errors, `5xx`, and connect failures are retried indefinitely at a fixed `RETRY_DELAY_MS`; a permanently broken upstream means a request hangs until the client disconnects.
+- **No request queueing, rate limiting, or backoff.** Thinking errors, `5xx`, WAF block pages, and connect failures are retried indefinitely at a fixed `RETRY_DELAY_MS`; a permanently broken upstream means a request hangs until the client disconnects.
 - **The fallback disables reasoning**, so the model may produce a lower-quality answer than a successful repair. It exists to keep you moving, not to be ideal. For Claude models behind new-api this is the only repair that works over the OpenAI dialect (see [Provider gotchas](#provider-gotchas)).
 
 ## FAQ

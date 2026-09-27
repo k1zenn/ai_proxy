@@ -226,6 +226,23 @@ function startFlakyUpstream(sequence) {
         res.end(JSON.stringify({ message: 'insufficient quota', type: 'billing_error' }));
         return;
       }
+      if (step === 'waf') {
+        // Aliyun WAF block page: HTTP 405 + HTML, not a real Method Not Allowed.
+        res.writeHead(405, { 'content-type': 'text/html' });
+        res.end(
+          '<!doctype html><html lang="zh-cn"><title>405</title><body>' +
+            '<div class="message">Sorry, your request has been blocked as it may cause potential threats to the server\'s security.</div>' +
+            '<textarea id="renderData" style="display:none">{"traceid":"0a0f6c3517905135839178129e5e0f","lang":"en"}</textarea>' +
+            '</body></html>',
+        );
+        return;
+      }
+      if (step === '405') {
+        // A real gateway 405 (JSON) must stay definitive.
+        res.writeHead(405, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'method not allowed' } }));
+        return;
+      }
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(
         JSON.stringify({
@@ -453,6 +470,23 @@ async function main() {
       }
     }
 
+    // An Aliyun WAF block page (405 + HTML) is edge- and payload-dependent;
+    // the proxy must retry it like a 5xx instead of forwarding HTML the
+    // client cannot parse.
+    {
+      const flaky = await startFlakyUpstream(['waf', '200']);
+      const retryProxy = await startProxy(flaky.port, { RETRY_ATTEMPTS: '5', RETRY_DELAY_MS: '0' });
+      try {
+        const r = await post(retryProxy.port, '/v1/chat/completions', openaiReplayFollowUp('call_waf_1'));
+        assert.equal(r.status, 200, 'WAF block page is retried -> 200');
+        assert.ok(flaky.seen.length >= 2, 'retried after WAF block page');
+        assert.ok(!/doctype html/i.test(r.text), 'client never sees the HTML block page');
+      } finally {
+        retryProxy.child.kill('SIGTERM');
+        flaky.server.close();
+      }
+    }
+
     // A definitive client error (a 4xx that is not the thinking error) must
     // still be forwarded immediately — never retried forever.
     {
@@ -462,6 +496,21 @@ async function main() {
         const r = await post(retryProxy.port, '/v1/chat/completions', openaiReplayFollowUp('call_bill_1'));
         assert.equal(r.status, 402, 'non-retryable 4xx forwarded as-is');
         assert.equal(flaky.seen.length, 1, 'non-retryable 4xx was not retried');
+      } finally {
+        retryProxy.child.kill('SIGTERM');
+        flaky.server.close();
+      }
+    }
+
+    // A genuine 405 from the gateway (JSON body, not a WAF block page) is
+    // still definitive and must not be retried forever.
+    {
+      const flaky = await startFlakyUpstream(['405', '200']);
+      const retryProxy = await startProxy(flaky.port, { RETRY_ATTEMPTS: '5', RETRY_DELAY_MS: '0' });
+      try {
+        const r = await post(retryProxy.port, '/v1/chat/completions', openaiReplayFollowUp('call_405_1'));
+        assert.equal(r.status, 405, 'plain JSON 405 forwarded as-is');
+        assert.equal(flaky.seen.length, 1, 'plain 405 was not retried');
       } finally {
         retryProxy.child.kill('SIGTERM');
         flaky.server.close();
